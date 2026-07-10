@@ -1,0 +1,64 @@
+name: Deploy Backend to Cloud Run
+
+on:
+  push:
+    branches:
+      - development
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: asia-southeast2
+  SERVICE_NAME: backend-api
+  AR_REPO: cloud-run-source-deploy
+  IMAGE_URL: asia-southeast2-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-source-deploy/backend-api
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build Docker image
+        run: docker build -t ${{ env.IMAGE_URL }}:${{ github.sha }} .
+
+      - name: Push Docker image
+        run: docker push ${{ env.IMAGE_URL }}:${{ github.sha }}
+
+      # DATABASE_URL contains characters (":", "/", "@", "?") that break gcloud's
+      # comma-separated --set-env-vars syntax, so env vars are passed via YAML file instead.
+      - name: Write runtime env vars
+        run: |
+          cat > env.yaml <<EOF
+          DEBUG: "False"
+          SECRET_KEY: "${{ secrets.SECRET_KEY }}"
+          ALLOWED_HOSTS: "${{ secrets.ALLOWED_HOSTS }}"
+          DATABASE_URL: "${{ secrets.DATABASE_URL }}"
+          FRONTEND_ORIGIN: "${{ secrets.FRONTEND_ORIGIN }}"
+          GEMINI_API_KEY: "${{ secrets.GEMINI_API_KEY }}"
+          EOF
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image=${{ env.IMAGE_URL }}:${{ github.sha }} \
+            --project=${{ env.PROJECT_ID }} \
+            --region=${{ env.REGION }} \
+            --platform=managed \
+            --allow-unauthenticated \
+            --port=8080 \
+            --env-vars-file=env.yaml
