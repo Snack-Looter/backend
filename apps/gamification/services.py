@@ -1,14 +1,18 @@
-import math
+import logging
 import random
 import string
 from datetime import timedelta
 
 from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
 
 from apps.accounts.models import PlayerRole
 from apps.catalog.models import Product
+from . import product_targeting_engine as engine
 from .models import Level, Mission, BattlePassMilestone, PlayerBattlePassReward
+
+logger = logging.getLogger(__name__)
 
 MISSIONS_PER_LEVEL = 5  # 5 misi Completed untuk naik level (role progression)
 REFERRAL_CODE_ALPHABET = string.ascii_uppercase + string.digits
@@ -81,15 +85,59 @@ def get_battle_pass_status(player) -> dict:
     }
 
 
-def pick_product_for_mission() -> Product:
+def _rank_products_with_engine(candidates: list[Product], target_gmv: float):
     """
-    MVP: pilih produk secara sederhana (mis. stok tersedia, acak).
-    TODO roadmap: AI Mission Generator berbasis data real (stok, expiry, sales trend).
+    Feed data ORM ke AI Priority Engine (RandomForest + TOPSIS, lihat
+    product_targeting_engine.py) lalu kembalikan product_id terpilih:
+    peringkat teratas yang harganya <= target GMV (supaya target quantity
+    masuk akal), atau peringkat teratas mutlak kalau semuanya di atas cap.
     """
-    candidates = Product.objects.filter(current_stock__gt=0)
-    if not candidates.exists():
+    # Impor lokal untuk memutus circular import:
+    # transactions.models -> gamification.models (Mission).
+    from apps.transactions.models import TransactionDetail
+
+    today = timezone.now().date()
+    products = [
+        {
+            "product_id": p.product_id,
+            "product_name": p.product_name,
+            "price": p.price,
+            "current_stock": p.current_stock,
+            "expired_date": p.expired_date,
+        }
+        for p in candidates
+    ]
+    # Engine hanya memakai histori 60 hari — batasi query-nya sekalian.
+    cutoff = today - timedelta(days=60)
+    transactions = list(
+        TransactionDetail.objects.filter(transaction__transaction_date__date__gte=cutoff)
+        .values("product_id", "quantity")
+        .annotate(transaction_date=F("transaction__transaction_date"))
+    )
+
+    ranked = engine.rank_products(products, transactions, today=today)
+    fits_cap = ranked[ranked["price"] <= float(target_gmv)]
+    chosen = fits_cap.iloc[0] if not fits_cap.empty else ranked.iloc[0]
+    return int(chosen["product_id"])
+
+
+def pick_product_for_mission(target_gmv: float) -> Product:
+    """
+    AI Mission Generator: pilih produk yang paling butuh didorong penjualannya
+    (mendekati expired, penjualan diprediksi rendah, stok menumpuk).
+    Kalau engine gagal (data aneh, dsb.) jatuh ke pilihan acak supaya
+    Generate Mission tidak pernah mati hanya karena ranking bermasalah.
+    """
+    candidates = list(Product.objects.filter(current_stock__gt=0))
+    if not candidates:
         raise ValueError("Tidak ada produk dengan stok tersedia untuk membuat mission.")
-    return random.choice(list(candidates))
+
+    try:
+        chosen_id = _rank_products_with_engine(candidates, target_gmv)
+        return next(p for p in candidates if p.product_id == chosen_id)
+    except Exception:
+        logger.exception("AI Priority Engine gagal, fallback ke pilihan acak.")
+        return random.choice(candidates)
 
 
 def _expire_if_overdue(mission: Mission) -> Mission:
@@ -137,12 +185,22 @@ def generate_mission(player, role) -> Mission:
     player_role = get_or_create_player_role(player, role)
     level_number = player_role.current_level_number
 
-    level = Level.objects.filter(role=role, level_number=level_number).first()
-    if level is None:
-        raise ValueError(f"Konfigurasi Level {level_number} untuk role {role.role_name} belum tersedia.")
+    # Level 1-10 sudah di-seed di db/schema.sql dengan rumus yang sama;
+    # get_or_create menjamin level di atasnya ikut rumus engine juga tanpa
+    # perlu seeding manual.
+    level, _ = Level.objects.get_or_create(
+        role=role,
+        level_number=level_number,
+        defaults={
+            "xp_reward": engine.xp_reward_for_level(level_number),
+            "gmv_target": engine.gmv_target_for_level(level_number),
+            "deadline_numberdays": engine.deadline_days_for_level(level_number),
+        },
+    )
 
-    product = pick_product_for_mission()
-    target_quantity = math.ceil(float(level.gmv_target) / float(product.price))
+    product = pick_product_for_mission(float(level.gmv_target))
+    # Floor min 1 unit (spec engine) — GMV jadi syarat pengikat, bukan quantity.
+    target_quantity = engine.target_quantity_for_gmv(float(level.gmv_target), float(product.price))
     deadline_date = timezone.now().date() + timedelta(days=level.deadline_numberdays)
 
     mission = Mission.objects.create(
