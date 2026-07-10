@@ -17,15 +17,21 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Keyless auth via Workload Identity Federation — required because this GCP
+      # org enforces iam.disableServiceAccountKeyCreation, so a JSON key was never
+      # an option. Only github.com/Snack-Looter/backend can mint tokens here (see
+      # the provider's attribute-condition + the per-repo IAM binding on the SA).
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+          workload_identity_provider: 'projects/873344091657/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: 'github-actions-deployer@kemenkop-hackathon-2026-e0a6.iam.gserviceaccount.com'
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
