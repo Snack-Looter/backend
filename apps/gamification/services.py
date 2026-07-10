@@ -140,6 +140,45 @@ def pick_product_for_mission(target_gmv: float) -> Product:
         return random.choice(candidates)
 
 
+def _complete_mission(mission: Mission) -> None:
+    """
+    Ganjar mission sebagai completed: tambah XP (role + total), naikkan level
+    role kalau genap MISSIONS_PER_LEVEL, dan cek unlock battle pass. Dipakai
+    baik oleh jalur verifikasi natural (target GMV/quantity tercapai dari
+    transaksi POS asli) maupun override demo (force_success=True).
+    """
+    mission.status = Mission.STATUS_COMPLETED
+    mission.completed_at = timezone.now()
+    mission.save(update_fields=["status", "completed_at"])
+
+    player_role = get_or_create_player_role(mission.player, mission.role)
+    xp_reward = mission.level.xp_reward
+    player_role.role_xp += xp_reward
+    player_role.mission_completed_count += 1
+    if player_role.mission_completed_count % MISSIONS_PER_LEVEL == 0:
+        player_role.current_level_number += 1
+    player_role.save()
+
+    mission.player.total_xp += xp_reward
+    mission.player.save(update_fields=["total_xp"])
+    check_battle_pass_unlocks(mission.player)
+
+
+def _fail_mission(mission: Mission) -> None:
+    """
+    Tandai mission failed. TIDAK mengurangi level/XP/stok (sesuai spesifikasi
+    progression) — dipakai oleh expiry otomatis, verifikasi natural yang lewat
+    deadline, maupun override demo (force_success=False).
+    """
+    mission.status = Mission.STATUS_FAILED
+    mission.completed_at = timezone.now()
+    mission.save(update_fields=["status", "completed_at"])
+
+    player_role = get_or_create_player_role(mission.player, mission.role)
+    player_role.mission_failed_count += 1
+    player_role.save(update_fields=["mission_failed_count", "updated_at"])
+
+
 def _expire_if_overdue(mission: Mission) -> Mission:
     """
     Lazy check: kalau mission masih ongoing tapi deadline sudah lewat, tandai
@@ -147,14 +186,7 @@ def _expire_if_overdue(mission: Mission) -> Mission:
     tidak butuh scheduler/cron terpisah.
     """
     if mission.status == Mission.STATUS_ONGOING and mission.deadline_date < timezone.now().date():
-        mission.status = Mission.STATUS_FAILED
-        mission.completed_at = timezone.now()
-        mission.save(update_fields=["status", "completed_at"])
-
-        player_role = get_or_create_player_role(mission.player, mission.role)
-        player_role.mission_failed_count += 1
-        player_role.save(update_fields=["mission_failed_count", "updated_at"])
-        # failed TIDAK mengurangi level/XP (sesuai spesifikasi progression)
+        _fail_mission(mission)
     return mission
 
 
@@ -220,42 +252,59 @@ def generate_mission(player, role) -> Mission:
 
 
 @transaction.atomic
-def verify_progress(mission: Mission) -> Mission:
+def verify_progress(mission: Mission, force_success: bool | None = None) -> Mission:
     """
-    Hitung progress dari transaksi POS riil yang sudah tervalidasi lewat
-    Referral Code (current_gmv/current_quantity di-update real-time oleh
-    ValidateReferralTransactionView tiap transaksi masuk — lihat
-    apps/transactions/views.py). Fungsi ini hanya mengecek apakah target
-    sudah tercapai, dan menandai failed kalau deadline sudah lewat.
+    Default (force_success=None): hitung progress dari transaksi POS riil
+    yang sudah tervalidasi lewat Referral Code (current_gmv/current_quantity
+    di-update real-time oleh ValidateReferralTransactionView tiap transaksi
+    masuk — lihat apps/transactions/views.py). Fungsi ini hanya mengecek
+    apakah target sudah tercapai, dan menandai failed kalau deadline lewat.
+
+    force_success eksplisit (True/False): override untuk tombol demo "Demo
+    Sukses"/"Demo Gagal" di Mission Detail — supaya juri bisa lihat kedua
+    skenario tanpa perlu transaksi POS asli. Sengaja TIDAK lewat
+    _expire_if_overdue: override ini harus selalu menang apa pun kondisi
+    deadline-nya, supaya presenter/juri selalu dapat hasil yang mereka
+    pilih (bukan diam-diam kalah oleh pengecekan deadline). Reward
+    (XP/level) dan penalti (failed count) memakai jalur yang sama persis
+    dengan verifikasi natural (_complete_mission/_fail_mission). Untuk
+    sukses via demo, stok cuma dikurangi sejumlah sisa target yang BELUM
+    terjual dari transaksi asli (target_quantity - current_quantity)
+    supaya tidak dobel-kurang kalau sebagian sudah terjual nyata sebelum
+    tombol demo ditekan.
     """
     if mission.status != Mission.STATUS_ONGOING:
         raise ValueError("Mission ini sudah tidak berstatus ongoing.")
 
-    mission = _expire_if_overdue(mission)
-    if mission.status == Mission.STATUS_FAILED:
+    if force_success is None:
+        mission = _expire_if_overdue(mission)
+        if mission.status == Mission.STATUS_FAILED:
+            return mission
+
+        target_reached = (
+            mission.current_gmv >= mission.target_gmv
+            and mission.current_quantity >= mission.target_quantity
+        )
+        if not target_reached:
+            return mission
+        _complete_mission(mission)
         return mission
 
-    target_reached = (
-        mission.current_gmv >= mission.target_gmv
-        and mission.current_quantity >= mission.target_quantity
-    )
-    if not target_reached:
+    if not force_success:
+        _fail_mission(mission)
         return mission
 
-    mission.status = Mission.STATUS_COMPLETED
-    mission.completed_at = timezone.now()
-    mission.save(update_fields=["status", "completed_at"])
+    remaining_quantity = max(mission.target_quantity - mission.current_quantity, 0)
+    if remaining_quantity:
+        product = Product.objects.select_for_update().filter(
+            product_id=mission.product_id_snapshot
+        ).first()
+        if product:
+            product.current_stock = max(product.current_stock - remaining_quantity, 0)
+            product.save(update_fields=["current_stock"])
 
-    player_role = get_or_create_player_role(mission.player, mission.role)
-    xp_reward = mission.level.xp_reward
-    player_role.role_xp += xp_reward
-    player_role.mission_completed_count += 1
-    if player_role.mission_completed_count % MISSIONS_PER_LEVEL == 0:
-        player_role.current_level_number += 1
-    player_role.save()
-
-    mission.player.total_xp += xp_reward
-    mission.player.save(update_fields=["total_xp"])
-    check_battle_pass_unlocks(mission.player)
-
+    mission.current_quantity = mission.target_quantity
+    mission.current_gmv = mission.target_gmv
+    mission.save(update_fields=["current_quantity", "current_gmv"])
+    _complete_mission(mission)
     return mission

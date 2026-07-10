@@ -93,7 +93,14 @@ class MissionDetailView(APIView):
 
 
 class VerifyProgressView(APIView):
-    """POST /api/missions/{id}/verify/ — tombol 'Verify Progress'."""
+    """
+    POST /api/missions/{id}/verify/
+    body opsional: { "force_success": true|false }
+
+    Tanpa force_success: verifikasi natural (cek current_gmv/current_quantity
+    dari transaksi POS riil). Dengan force_success: override tombol demo
+    "Demo Sukses"/"Demo Gagal" di Mission Detail — lihat services.verify_progress.
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, mission_id):
@@ -102,8 +109,13 @@ class VerifyProgressView(APIView):
         ).first()
         if mission is None:
             return Response({"error": "Mission tidak ditemukan"}, status=404)
+
+        force_success = request.data.get("force_success")
+        if force_success is not None:
+            force_success = bool(force_success)
+
         try:
-            mission = services.verify_progress(mission)
+            mission = services.verify_progress(mission, force_success=force_success)
         except ValueError as e:
             return Response({"error": str(e)}, status=400)
         return Response(MissionSerializer(mission).data)
