@@ -2,10 +2,7 @@ import requests
 from django.conf import settings
 from .prompts import SYSTEM_PROMPT
 
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-flash-latest:generateContent"
-)
+GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
 def ask_gemini(message: str) -> str:
@@ -17,12 +14,14 @@ def ask_gemini(message: str) -> str:
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY belum diset di .env")
 
+    model = getattr(settings, "GEMINI_MODEL", "gemini-3.1-flash-lite")
+
     payload = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": message}]}],
     }
     resp = requests.post(
-        f"{GEMINI_URL}?key={api_key}",
+        f"{GEMINI_API_BASE_URL}/{model}:generateContent?key={api_key}",
         json=payload,
         timeout=15,
     )
