@@ -4,7 +4,7 @@ from .prompts import SYSTEM_PROMPT
 
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.5-flash:generateContent"
+    "gemini-flash-latest:generateContent"
 )
 
 
